@@ -1,6 +1,5 @@
 import NIO
 @preconcurrency import NIOSSH
-import Logging
 import NIOConcurrencyHelpers
 
 final class SSHClientInboundChannelHandler: Sendable {
@@ -62,66 +61,6 @@ final class SSHClientInboundChannelHandler: Sendable {
     }
 }
 
-final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
-    typealias InboundIn = Any
-
-    private let promise: EventLoopPromise<Void>
-    let logger = Logger(label: "nl.orlandos.citadel.handshake")
-
-    /// A future that will be fulfilled when the handshake is complete.
-    public var authenticated: EventLoopFuture<Void> {
-        promise.futureResult
-    }
-
-    init(eventLoop: EventLoop, loginTimeout: TimeAmount) {
-        let promise = eventLoop.makePromise(of: Void.self)
-        self.promise = promise
-
-        eventLoop.scheduleTask(deadline: .now() + loginTimeout) {
-            promise.fail(ChannelError.connectTimeout(loginTimeout))
-        }
-    }
-
-    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if event is UserAuthSuccessEvent {
-            self.promise.succeed(())
-        }
-    }
-
-    func errorCaught(context: ChannelHandlerContext, error: any Error) {
-        self.promise.fail(error)
-    }
-    
-    deinit {
-        struct Disconnected: Error {}
-        self.promise.fail(Disconnected())
-    }
-}
-
-public struct SSHClientSettings: Sendable {
-    public var host: String
-    public var port: Int
-    public var authenticationMethod: @Sendable () -> SSHAuthenticationMethod
-    public var hostKeyValidator: SSHHostKeyValidator
-    public var algorithms: SSHAlgorithms = SSHAlgorithms()
-    public var protocolOptions: Set<SSHProtocolOption> = []
-    public var group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton
-    internal var channelHandlers: [ChannelHandler & Sendable] = []
-    public var connectTimeout: TimeAmount = .seconds(30)
-
-    public init(
-        host: String,
-        port: Int = 22,
-        authenticationMethod: @Sendable @escaping () -> SSHAuthenticationMethod,
-        hostKeyValidator: SSHHostKeyValidator
-    ) {
-        self.host = host
-        self.port = port
-        self.authenticationMethod = authenticationMethod
-        self.hostKeyValidator = hostKeyValidator
-    }
-}
-
 final class SSHClientSession: Sendable {
     let channel: Channel
     let sshHandler: NIOLoopBoundBox<NIOSSHHandler>
@@ -165,11 +104,15 @@ final class SSHClientSession: Sendable {
     static func addHandlers(
         on channel: Channel,
         inboundChannelHandler: SSHClientInboundChannelHandler,
-        settings: SSHClientSettings
+        settings: SSHClientSettings,
+        authenticationTimeout: TimeAmount = .seconds(10),
+        onUserAuthenticationBanner:
+            (@Sendable (_ message: String, _ languageTag: String) -> Void)? = nil
     ) -> EventLoopFuture<Void> {
         let handshakeHandler = ClientHandshakeHandler(
             eventLoop: channel.eventLoop,
-            loginTimeout: .seconds(10)
+            authenticationTimeout: authenticationTimeout,
+            onUserAuthenticationBanner: onUserAuthenticationBanner
         )
         var clientConfiguration = SSHClientConfiguration(
             userAuthDelegate: settings.authenticationMethod(),
@@ -206,34 +149,65 @@ final class SSHClientSession: Sendable {
     ) async throws -> SSHClientSession {
         let eventLoop = settings.group.any()
         let inboundChannelHandler = SSHClientInboundChannelHandler()
-        var clientConfiguration = SSHClientConfiguration(
-            userAuthDelegate: settings.authenticationMethod(),
-            serverAuthDelegate: settings.hostKeyValidator
-        )
-        
-        settings.algorithms.apply(to: &clientConfiguration)
-        
-        for option in settings.protocolOptions {
-            option.apply(to: &clientConfiguration)
-        }
-        
+        let lifetime = ConnectionLifetime()
         let bootstrap = ClientBootstrap(group: eventLoop).channelInitializer { channel in
-            return Self.addHandlers(on: channel, inboundChannelHandler: inboundChannelHandler, settings: settings)
+            guard lifetime.publish(channel) else {
+                return channel.eventLoop.makeFailedFuture(CancellationError())
+            }
+            return Self.addHandlers(
+                on: channel,
+                inboundChannelHandler: inboundChannelHandler,
+                settings: settings,
+                authenticationTimeout: settings.authenticationTimeout,
+                onUserAuthenticationBanner: settings.onUserAuthenticationBanner
+            )
         }
         .connectTimeout(settings.connectTimeout)
 //        .channelOption(ChannelOptions.autoRead, value: true)
         .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
         .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
         
-        return try await bootstrap.connect(host: settings.host, port: settings.port).flatMap { channel in
-            channel.pipeline.handler(type: ClientHandshakeHandler.self).flatMap { handshakeHandler in
-                handshakeHandler.authenticated
-            }.flatMap {
-                channel.pipeline.handler(type: NIOSSHHandler.self)
-            }.map { sshHandler in
-                SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler)
+        return try await withTaskCancellationHandler {
+            do {
+                try Task.checkCancellation()
+                let channel = try await bootstrap.connect(
+                    host: settings.host,
+                    port: settings.port
+                ).get()
+                try Task.checkCancellation()
+                let handshakeHandler = try await channel.pipeline.handler(
+                    type: ClientHandshakeHandler.self
+                ).get()
+                try await handshakeHandler.authenticated.get()
+                let session = try await channel.pipeline.handler(
+                    type: NIOSSHHandler.self
+                ).map { sshHandler in
+                    SSHClientSession(
+                        channel: channel,
+                        inboundChannelHandler: inboundChannelHandler,
+                        sshHandler: sshHandler
+                    )
+                }.get()
+
+                try Task.checkCancellation()
+                guard lifetime.handOff(unlessCancelled: { Task.isCancelled }) else {
+                    throw CancellationError()
+                }
+                handshakeHandler.cancelTimeout()
+                return session
+            } catch {
+                if let channel = lifetime.finish() {
+                    channel.close(promise: nil)
+                    try? await channel.closeFuture.get()
+                }
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                throw error
             }
-        }.get()
+        } onCancel: {
+            lifetime.cancel()
+        }
     }
     
     /// Creates a new SSH session on a new channel. This will connect to the given host and port.

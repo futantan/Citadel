@@ -49,6 +49,7 @@ let package = Package(
             dependencies: [
                 "Citadel",
                 .product(name: "NIOSSH", package: "swift-nio-ssh"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "BigInt", package: "BigInt"),
                 .product(name: "Logging", package: "swift-log"),
             ]
