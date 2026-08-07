@@ -74,11 +74,52 @@ public struct TTYOutput: AsyncSequence {
 /// Allows writing data to a TTY's standard input and controlling terminal properties
 public struct TTYStdinWriter {
     internal let channel: Channel
+    private let hasSentEOF: NIOLockedValueBox<Bool>
+
+    internal init(channel: Channel) {
+        self.channel = channel
+        self.hasSentEOF = NIOLockedValueBox(false)
+    }
 
     /// Write raw bytes to the TTY's standard input
     /// - Parameter buffer: The bytes to write
     public func write(_ buffer: ByteBuffer) async throws {
         try await channel.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(buffer)))
+    }
+
+    /// Half-closes standard input by sending `SSH_MSG_CHANNEL_EOF`
+    ///
+    /// The channel stays open for reading, so anything the remote command writes
+    /// after this point is still delivered. Commands that read stdin to EOF
+    /// before they answer — `sort`, `cat`, or any request/response protocol
+    /// carried over an exec channel — need this call, otherwise both sides wait
+    /// on each other forever.
+    ///
+    /// RFC 4254 allows one `SSH_MSG_CHANNEL_EOF` per channel, so this sends EOF
+    /// at most once per writer: later calls return without touching the channel.
+    /// Writing after EOF fails with `ChannelError.outputClosed`.
+    ///
+    /// - Throws: `ChannelError.alreadyClosed` if the channel is already fully
+    ///           closed, or any error the write of the EOF frame fails with.
+    ///
+    /// ## Example
+    /// ```swift
+    /// try await client.withExec("sort") { inbound, outbound in
+    ///     try await outbound.write(ByteBuffer(string: "b\na\n"))
+    ///     try await outbound.sendEOF()
+    ///
+    ///     for try await output in inbound { /* "a\nb\n" */ }
+    /// }
+    /// ```
+    public func sendEOF() async throws {
+        let shouldSend = hasSentEOF.withLockedValue { sent in
+            guard !sent else { return false }
+            sent = true
+            return true
+        }
+
+        guard shouldSend else { return }
+        try await channel.close(mode: .output).get()
     }
 
     public func changeSize(cols: Int, rows: Int, pixelWidth:Int, pixelHeight:Int) async throws {
