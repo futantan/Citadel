@@ -10,6 +10,19 @@ public struct TTYSTDError: Error {
     public let message: ByteBuffer
 }
 
+/// Thrown when a PTY session's channel ends without the remote ever reporting an
+/// exit-status.
+///
+/// A clean remote exit (user `exit`/`logout`, the attached command finishing)
+/// always delivers `SSHChannelRequestEvent.ExitStatus` before the channel closes.
+/// When the channel tears down with no such event — the server died, the TCP
+/// connection was closed by an intermediary, or the transport otherwise ended —
+/// the PTY stream finishes with this error instead of a clean finish, so callers
+/// can tell a session-level exit apart from a connection-level interruption.
+public struct SSHSessionEndedWithoutExitStatus: Error {
+    public init() {}
+}
+
 /// A pair of streams representing the stdout and stderr output of an executed command
 public struct ExecCommandStream {
     /// An async stream of bytes representing the standard output
@@ -56,6 +69,14 @@ public enum ExecCommandOutput {
 public struct TTYOutput: AsyncSequence {
     internal let sequence: AsyncThrowingStream<ExecCommandOutput, Error>
     public typealias Element = ExecCommandOutput
+
+    /// Wraps an arbitrary stream as TTY output.
+    ///
+    /// Citadel builds `TTYOutput` internally for live channels; this initializer
+    /// exists so test targets can construct inbound streams to drive fakes.
+    public init(sequence: AsyncThrowingStream<ExecCommandOutput, Error>) {
+        self.sequence = sequence
+    }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         public typealias Element = ExecCommandOutput
@@ -310,27 +331,35 @@ extension SSHClient {
         case pty(SSHChannelRequestEvent.PseudoTerminalRequest, command: String?), tty(command: String?), command(String)
     }
 
-    internal func _executeCommandStream(
-        environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
-        mode: CommandMode
-    ) async throws -> (channel: Channel, output: AsyncThrowingStream<ExecCommandOutput, Error>) {
-        let (stream, streamContinuation) = AsyncThrowingStream<ExecCommandOutput, Error>.makeStream()
-
+    /// Builds the channel handler that maps `ExecCommandHandler.Output` events onto
+    /// the command stream, including the stream's termination classification.
+    ///
+    /// Static and connection-free so tests can drive the real classification logic
+    /// through an `EmbeddedChannel` without a live SSH session.
+    internal static func makeExecOutputHandler(
+        logger: Logger,
+        mode: CommandMode,
+        continuation streamContinuation: AsyncThrowingStream<ExecCommandOutput, Error>.Continuation
+    ) -> ExecCommandHandler {
         let hasReceivedChannelSuccess = NIOLockedValueBox<Bool>(false)
         let exitCode = NIOLockedValueBox<Int?>(nil)
 
-        let handler = ExecCommandHandler(logger: logger) { channel, output in
+        return ExecCommandHandler(logger: logger) { channel, output in
             switch output {
             case .stdout(let stdout):
                 streamContinuation.yield(.stdout(stdout))
             case .stderr(let stderr):
                 streamContinuation.yield(.stderr(stderr))
             case .eof(let error):
-                self.logger.debug("EOF triggered, ending the command stream.")
+                logger.debug("EOF triggered, ending the command stream.")
                 if let error {
                     streamContinuation.finish(throwing: error)
                 } else if let exitCode = exitCode.withLockedValue({ $0 }), exitCode != 0 {
                     streamContinuation.finish(throwing: CommandFailed(exitCode: exitCode))
+                } else if case .pty = mode, exitCode.withLockedValue({ $0 }) == nil {
+                    // A PTY session always receives an exit-status before a clean
+                    // remote exit; EOF without one means the connection was cut.
+                    streamContinuation.finish(throwing: SSHSessionEndedWithoutExitStatus())
                 } else {
                     streamContinuation.finish()
                 }
@@ -344,10 +373,23 @@ extension SSHClient {
                     hasReceivedChannelSuccess.withLockedValue({ $0 = true })
                 }
             case .exit(let status):
-                self.logger.debug("Process exited with status code \(status). Will await on EOF for correct exit")
+                logger.debug("Process exited with status code \(status). Will await on EOF for correct exit")
                 exitCode.withLockedValue({ $0 = status })
             }
         }
+    }
+
+    internal func _executeCommandStream(
+        environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
+        mode: CommandMode
+    ) async throws -> (channel: Channel, output: AsyncThrowingStream<ExecCommandOutput, Error>) {
+        let (stream, streamContinuation) = AsyncThrowingStream<ExecCommandOutput, Error>.makeStream()
+
+        let handler = Self.makeExecOutputHandler(
+            logger: logger,
+            mode: mode,
+            continuation: streamContinuation
+        )
 
         let channel = try await eventLoop.flatSubmit { [eventLoop, sshHandler = session.sshHandler] in
             let createChannel = eventLoop.makePromise(of: Channel.self)
