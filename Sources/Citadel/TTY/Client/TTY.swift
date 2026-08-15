@@ -10,17 +10,22 @@ public struct TTYSTDError: Error {
     public let message: ByteBuffer
 }
 
-/// Thrown when a PTY session's channel ends without the remote ever reporting an
-/// exit-status.
+/// Thrown when a command or session channel ends without the remote ever
+/// reporting an exit-status.
 ///
-/// A clean remote exit (user `exit`/`logout`, the attached command finishing)
-/// always delivers `SSHChannelRequestEvent.ExitStatus` before the channel closes.
+/// A clean remote exit (the command finishing, user `exit`/`logout`) always
+/// delivers `SSHChannelRequestEvent.ExitStatus` before the channel closes,
+/// in every command mode — exec (`.command`), shell (`.tty`), and PTY.
 /// When the channel tears down with no such event — the server died, the TCP
 /// connection was closed by an intermediary, or the transport otherwise ended —
-/// the PTY stream finishes with this error instead of a clean finish, so callers
+/// the stream finishes with this error instead of a clean finish, so callers
 /// can tell a session-level exit apart from a connection-level interruption.
-public struct SSHSessionEndedWithoutExitStatus: Error {
+public struct SSHSessionEndedWithoutExitStatus: Error, LocalizedError {
     public init() {}
+
+    public var errorDescription: String? {
+        "The SSH connection ended before the command finished."
+    }
 }
 
 /// A pair of streams representing the stdout and stderr output of an executed command
@@ -356,9 +361,9 @@ extension SSHClient {
                     streamContinuation.finish(throwing: error)
                 } else if let exitCode = exitCode.withLockedValue({ $0 }), exitCode != 0 {
                     streamContinuation.finish(throwing: CommandFailed(exitCode: exitCode))
-                } else if case .pty = mode, exitCode.withLockedValue({ $0 }) == nil {
-                    // A PTY session always receives an exit-status before a clean
-                    // remote exit; EOF without one means the connection was cut.
+                } else if exitCode.withLockedValue({ $0 }) == nil {
+                    // Every mode receives an exit-status before a clean remote
+                    // exit; EOF without one means the connection was cut.
                     streamContinuation.finish(throwing: SSHSessionEndedWithoutExitStatus())
                 } else {
                     streamContinuation.finish()

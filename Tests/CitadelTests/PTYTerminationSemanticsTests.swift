@@ -105,15 +105,69 @@ final class PTYTerminationSemanticsTests: XCTestCase {
         XCTAssertEqual(commandFailed.exitCode, 1)
     }
 
-    func testExecCommandStreamWithoutExitStatusStillFinishesCleanly() async throws {
-        // The `.command` (exec) mode keeps today's semantics; only `.pty` reports
-        // the missing exit-status as an error. The exec-side gap is a separate
-        // ticket (issue #410 design §7).
+    func testExecCommandStreamWithoutExitStatusThrowsNamedError() async throws {
+        // Issue #411: `.command` (exec) shares the `.pty` semantics — EOF without
+        // an exit-status means the connection was cut, not a clean completion.
         let end = try await endOfStream(mode: .command("true"), exitStatus: nil)
 
-        guard case .clean = end else {
-            XCTFail("Exec-mode stream termination semantics must stay unchanged, got \(end)")
+        guard case .failed(let error) = end else {
+            XCTFail("Exec-mode stream that ended without an exit-status finished cleanly; expected SSHSessionEndedWithoutExitStatus")
             return
         }
+        XCTAssert(
+            error is SSHSessionEndedWithoutExitStatus,
+            "Expected SSHSessionEndedWithoutExitStatus, got \(error)"
+        )
+    }
+
+    func testExecCommandStreamAfterExitZeroFinishesCleanly() async throws {
+        let end = try await endOfStream(mode: .command("true"), exitStatus: 0)
+
+        guard case .clean = end else {
+            XCTFail("Exec-mode stream with exit-status 0 should finish cleanly, got \(end)")
+            return
+        }
+    }
+
+    func testExecCommandStreamAfterNonZeroExitThrowsCommandFailed() async throws {
+        let end = try await endOfStream(mode: .command("false"), exitStatus: 1)
+
+        guard case .failed(let error) = end, let commandFailed = error as? SSHClient.CommandFailed else {
+            XCTFail("Exec-mode stream with exit-status 1 should throw CommandFailed, got \(end)")
+            return
+        }
+        XCTAssertEqual(commandFailed.exitCode, 1)
+    }
+
+    func testTTYStreamWithoutExitStatusThrowsNamedError() async throws {
+        let end = try await endOfStream(mode: .tty(command: "true"), exitStatus: nil)
+
+        guard case .failed(let error) = end else {
+            XCTFail("TTY-mode stream that ended without an exit-status finished cleanly; expected SSHSessionEndedWithoutExitStatus")
+            return
+        }
+        XCTAssert(
+            error is SSHSessionEndedWithoutExitStatus,
+            "Expected SSHSessionEndedWithoutExitStatus, got \(error)"
+        )
+    }
+
+    func testTTYStreamAfterExitZeroFinishesCleanly() async throws {
+        let end = try await endOfStream(mode: .tty(command: "true"), exitStatus: 0)
+
+        guard case .clean = end else {
+            XCTFail("TTY-mode stream with exit-status 0 should finish cleanly, got \(end)")
+            return
+        }
+    }
+
+    func testTTYStreamAfterNonZeroExitThrowsCommandFailed() async throws {
+        let end = try await endOfStream(mode: .tty(command: "false"), exitStatus: 1)
+
+        guard case .failed(let error) = end, let commandFailed = error as? SSHClient.CommandFailed else {
+            XCTFail("TTY-mode stream with exit-status 1 should throw CommandFailed, got \(end)")
+            return
+        }
+        XCTAssertEqual(commandFailed.exitCode, 1)
     }
 }
