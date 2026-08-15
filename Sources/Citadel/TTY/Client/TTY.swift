@@ -435,6 +435,28 @@ extension SSHClient {
         return (channel, stream)
     }
 
+    /// Runs `perform`, then closes the channel via `close`.
+    ///
+    /// Shared cleanup shape of `withPTY`, `withTTY`, and `withExec`. When
+    /// `perform` throws (e.g. the inbound stream fails with
+    /// ``SSHSessionEndedWithoutExitStatus``), that original error must be
+    /// rethrown; the cleanup `close()` on a dead connection typically throws
+    /// `ChannelError.alreadyClosed` and must not mask it.
+    internal static func performThenClose(
+        perform: () async throws -> Void,
+        close: () async throws -> Void
+    ) async throws {
+        do {
+            try await perform()
+            try await close()
+        } catch {
+            // Best-effort cleanup: on a dead connection close() throws
+            // ChannelError.alreadyClosed, which must not mask `error`.
+            try? await close()
+            throw error
+        }
+    }
+
     /// Creates a pseudo-terminal (PTY) session and executes the provided closure with input/output streams
     /// - Parameters:
     ///   - request: PTY configuration parameters
@@ -456,18 +478,13 @@ extension SSHClient {
             mode: .pty(request, command: command)
         )
 
-        func close() async throws {
-            try await channel.close()
-        }
-
-        do {
-            let inbound = TTYOutput(sequence: output)
-            try await perform(inbound, TTYStdinWriter(channel: channel))
-            try await close()
-        } catch {
-            try await close()
-            throw error
-        }
+        try await Self.performThenClose(
+            perform: {
+                let inbound = TTYOutput(sequence: output)
+                try await perform(inbound, TTYStdinWriter(channel: channel))
+            },
+            close: { try await channel.close() }
+        )
     }
 
     /// Creates a TTY session and executes the provided closure with input/output streams
@@ -505,18 +522,13 @@ extension SSHClient {
             mode: .tty(command: nil)
         )
 
-        func close() async throws {
-            try await channel.close()
-        }
-
-        do {
-            let inbound = TTYOutput(sequence: output)
-            try await perform(inbound, TTYStdinWriter(channel: channel))
-            try await close()
-        } catch {
-            try await close()
-            throw error
-        }
+        try await Self.performThenClose(
+            perform: {
+                let inbound = TTYOutput(sequence: output)
+                try await perform(inbound, TTYStdinWriter(channel: channel))
+            },
+            close: { try await channel.close() }
+        )
     }
 
     /// Executes a command via SSH exec channel with bidirectional I/O
@@ -562,18 +574,13 @@ extension SSHClient {
             mode: .command(command)
         )
 
-        func close() async throws {
-            try await channel.close()
-        }
-
-        do {
-            let inbound = TTYOutput(sequence: output)
-            try await perform(inbound, TTYStdinWriter(channel: channel))
-            try await close()
-        } catch {
-            try await close()
-            throw error
-        }
+        try await Self.performThenClose(
+            perform: {
+                let inbound = TTYOutput(sequence: output)
+                try await perform(inbound, TTYStdinWriter(channel: channel))
+            },
+            close: { try await channel.close() }
+        )
     }
 
     /// Executes a command and returns separate stdout and stderr streams
